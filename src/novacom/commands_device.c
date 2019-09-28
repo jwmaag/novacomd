@@ -907,7 +907,7 @@ static void novacom_spawn_process(device_handle_t device_handle, int channel, co
 		}
 
 		/* create a simple subprocess directly, not a session leader */
-		setpgrp();
+		setpgrp(0,0);
 
 		/* Go back to the normal scheduler */
 		struct sched_param params;

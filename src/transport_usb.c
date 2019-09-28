@@ -609,7 +609,7 @@ int novacom_usbll_process_packet(novacom_usbll_handle_t usbll_handle, const char
 								log_printf(LOG_LLTRACE, "invalid data definition within syn packet\n");
 							}
 #if HOST
-#if defined(__linux__)
+#if defined(__linux__) || defined(__FreeBSD__)
 							/* notify transport layer about new device, so recovery tokens are disposed */
 							(void)novacom_usb_transport_deviceonline(usbll_handle->remote_nduid);
 #endif
