@@ -249,7 +249,7 @@ novacom_usb_tx_thread(void *arg)
         handle->tx_timeout = novacom_usbll_get_timeout(handle->usbll_handle);
         while (!novacom_shutdown && !handle->shutdown) {
                 // see if we have something to send
-				packet.len = novacom_usbll_get_mtu(handle->usbll_handle);
+		packet.len = novacom_usbll_get_mtu(handle->usbll_handle);
                 packet.buf = buf;
                 if (novacom_usbll_prepare_tx_packet(handle->usbll_handle, &packet, 100) != TX_NO_PACKET) {
                         // write a block back
