@@ -24,7 +24,6 @@
 
 // novacom_usb_handle_t
 typedef struct {
-	libusb_context *ctx;
 	libusb_device *dev;
 	libusb_device_handle *hdl;
 
@@ -61,6 +60,7 @@ volatile int novacom_shutdown=0;
 TAILQ_HEAD(recovery_queue_s, recovery_entry_s)  t_recovery_queue;
 static platform_thread_t findandattach_thread;
 static platform_mutex_t recovery_lock;
+static libusb_context *ctx;
 
 static void* novacom_usb_findandattach_thread(void*);
 //static void* novacom_usb_tx_thread(void*);
@@ -68,8 +68,8 @@ static void* novacom_usb_findandattach_thread(void*);
 
 int
 novacom_usb_transport_init(void)
-{	
-	return(0);
+{
+	return (libusb_init(&ctx));
 }
 
 int
@@ -87,6 +87,7 @@ novacom_usb_transport_stop(void)
 	novacom_shutdown = 1;
 	platform_waitfor_thread(findandattach_thread);
 	platform_mutex_destroy(&recovery_lock);
+	libusb_exit(ctx);
 	return (0);
 }
 
@@ -117,6 +118,7 @@ novacom_usb_write(novacom_usb_handle_t *handle, void *buf, size_t len, int *xfer
 static int
 novacom_usb_close(novacom_usb_handle_t *usb_handle)
 {
+	log_printf(LOG_ALWAYS, "releasing interface for handle %p, interface: %d\n", usb_handle->hdl, usb_handle->iface);
 	libusb_release_interface(usb_handle->hdl, usb_handle->iface);
 	libusb_close(usb_handle->hdl);
 	usb_handle->hdl = NULL;
@@ -155,77 +157,19 @@ novacom_usb_find_endpoints(libusb_device *dev, libusb_device_handle *hdl, int ep
 					continue;
 
 				rc = libusb_claim_interface(hdl, i);
-				if (rc)
-					return -1;
+				log_printf(LOG_ALWAYS, "attempting to claim interface handle: %p, interface: %d, rc: %d\n", hdl, i, rc);
+				if (rc) {
+					log_printf(LOG_ERROR, "failed to claim interface %d, rc %d\n", i, rc);
+					return (-1);
+				} else if (iface) {
+					*iface = i;
+				}
 				
-				*iface = i;
 				return (0);
 			}
 		}	
 	}
 	return -1;
-}
-
-/* Find the device and open it returning our own handle 
- */
-static novacom_usb_handle_t*
-novacom_usb_open(libusb_context *ctx)
-{
-	novacom_usb_handle_t *nhdl;
-	libusb_device **list, *dev = NULL, *found = NULL;
-	libusb_device_handle *hdl;
-	libusb_device_descriptor d;
-	int iface, ep[2];
-	size_t n, i, j;
-
-	nhdl = NULL;
-	n = libusb_get_device_list(ctx, &list);
-
-	// loop over devices
-	for (i = 0; i < n; i++) {
-		dev = list[i];
-		libusb_get_device_descriptor(dev, &d);
-		
-		//compare with the internal list of supprted devices
-		for (j = 0; usbid_list[j].name; j++) {
-			if ((d.idVendor == usbid_list[j].vendor) && 
-				(d.idProduct == usbid_list[j].product)) {
-
-				found = libusb_ref_device(dev);
-
-				if (libusb_open(dev, &hdl) != 0)
-					continue;
-				
-				
-				if (novacom_usb_find_endpoints(dev, hdl, ep, &iface) != 0)
-					continue;
-				
-
-				nhdl = platform_calloc(sizeof(novacom_usb_handle_t));
-				if(!nhdl) {
-					libusb_close(hdl);
-					return (NULL);
-				}
-				
-				nhdl->ctx = ctx;
-				nhdl->dev = dev;
-				nhdl->hdl = hdl;
-				nhdl->iface = iface;
-				nhdl->rxep = ep[0];
-				nhdl->txep = ep[1];
-				nhdl->devtype = usbid_list[j].name;	
-				nhdl->busnum = libusb_get_bus_number(dev);
-				nhdl->devnum = libusb_get_device_address(dev);
-				
-				// return our handle
-				goto exit;
-			}
-		}
-	}
-	
-exit:
-	libusb_free_device_list(list, 1);
-	return nhdl;
 }
 
 // thread main
@@ -241,10 +185,10 @@ novacom_usb_tx_thread(void *arg)
         buf = platform_calloc(MAX_MTU);
         platform_assert(buf != NULL);
 
-        LTRACEF("start::wait for startup event: %p\n", handle);
+        log_printf(LOG_ALWAYS, "start::wait for startup event: %p\n", handle);
         platform_event_wait(&handle->tx_startup_event);   //why waiting rx for starting ???
         handle->tx_startup_wait = 0;                      //change status to started
-        LTRACEF("start::startup event received, continue: %p\n", handle);
+        log_printf(LOG_ALWAYS, "start::startup event received, continue: %p\n", handle);
 
         handle->tx_timeout = novacom_usbll_get_timeout(handle->usbll_handle);
         while (!novacom_shutdown && !handle->shutdown) {
@@ -482,38 +426,145 @@ novacom_usb_rx_thread(void *arg)
 	return NULL;
 }
 
-static void*
-novacom_usb_findandattach_thread(void *arg)
+static novacom_usb_handle_t* 
+novacom_usb_open(libusb_device *dev, const char* name) 
 {
-	libusb_context *ctx;
-	novacom_usb_handle_t *usb;
+
+	int iface, ep[2];
+	novacom_usb_handle_t *nhdl;
+	libusb_device_handle *hdl;
+
+	if (libusb_open(dev, &hdl) != 0) {
+		log_printf(LOG_ERROR, "unable to open device handle, error on libusb_open");
+		return (NULL);
+	}
+			
+	if (novacom_usb_find_endpoints(dev, hdl, ep, &iface) != 0) {
+		log_printf(LOG_ERROR, "unable to open device, could not find endpoints");
+		libusb_close(hdl);
+		return (NULL);
+	}
+
+	nhdl = platform_calloc(sizeof(novacom_usb_handle_t));
+	if(!nhdl) {
+		libusb_close(hdl);
+		return (NULL);
+	}
 	
-	libusb_init(&ctx);
+	nhdl->ctx = ctx;
+	nhdl->dev = dev;
+	nhdl->hdl = hdl;
+	nhdl->iface = iface;
+	nhdl->rxep = ep[0];
+	nhdl->txep = ep[1];
+	nhdl->devtype = name;	
+	nhdl->busnum = libusb_get_bus_number(dev);
+	nhdl->devnum = libusb_get_device_address(dev);
 
-	// not sure what this is for since libusb does this for
-	// us i believe
-	while(!novacom_shutdown){
-		usb = novacom_usb_open(ctx);
-		if (usb) {
-			usb->shutdown = false;
-			TRACEF("usb_handle 0x%08x, bus=%03d dev=%03d\n", usb->usbll_handle, usb->busnum, usb->devnum);
-                        platform_event_create(&usb->tx_startup_event);
-                        platform_event_unsignal(&usb->tx_startup_event);
-                        usb->tx_startup_wait = 1;
-                        platform_event_create(&usb->tx_shutdown_event);
-                        platform_event_unsignal(&usb->tx_shutdown_event);
+	platform_event_create(&nhdl->tx_startup_event);
+	platform_event_unsignal(&nhdl->tx_startup_event);
+	nhdl->tx_startup_wait = 1;
+	platform_event_create(&nhdl->tx_shutdown_event);
+	platform_event_unsignal(&nhdl->tx_shutdown_event);
 
-                        platform_create_thread(NULL, &novacom_usb_rx_thread, (void *)usb);
-                        platform_create_thread(NULL, &novacom_usb_tx_thread, (void *)usb);	
-		}
-		if (!novacom_shutdown) {
-			sleep(1);
-			(void) usbrecords_update(1);
+	platform_create_thread(NULL, &novacom_usb_rx_thread, (void *)nhdl);
+	platform_create_thread(NULL, &novacom_usb_tx_thread, (void *)nhdl);	
+	return (nhdl);
+}
+
+static int 
+novacom_register_attached_devices()
+{
+	novacom_usb_handle_t *nhdl;
+	libusb_device_descriptor d;
+	libusb_device **list, *dev = NULL, *found = NULL;
+	int count;
+	size_t n, i, j;
+	count = 0;
+
+	nhdl = NULL;
+	n = libusb_get_device_list(ctx, &list);
+
+	// loop over devices
+	for (i = 0; i < n; i++) {
+		dev = list[i];
+		libusb_get_device_descriptor(dev, &d);
+		
+		//compare with the internal list of supprted devices
+		for (j = 0; usbid_list[j].name; j++) {
+			if ((d.idVendor == usbid_list[j].vendor) && 
+				(d.idProduct == usbid_list[j].product)) {
+				found = libusb_ref_device(dev);
+				if(novacom_usb_open(found, usbid_list[j].name) != NULL)
+					count++;
+
+			}
 		}
 	}
 	
+	libusb_free_device_list(list, 1);
+	return (count);
+	
+}
+
+
+static int
+novacom_usb_hotplug_callback(libusb_context *ctx, libusb_device *dev, 
+	libusb_hotplug_event evt, void* arg)
+{
+
+	libusb_device_descriptor desc;
+
+	switch(evt) {
+	case LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT:
+		log_printf(LOG_ALWAYS, "hotplug device removal\n");
+		break;
+	case LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED:
+		log_printf(LOG_ALWAYS, "hotplug device added\n");
+		libusb_get_device_descriptor(dev, &desc);
+
+		for(int i=0; usbid_list[i].name; i++) {
+			if ((desc.idVendor == usbid_list[i].vendor) && 
+				(desc.idProduct == usbid_list[i].product)) {
+				
+				// maybe not needed? found = libusb_ref_device(dev);
+				if(novacom_usb_open(dev, usbid_list[i].name) != NULL) {
+					log_printf(LOG_ALWAYS, "attached to device %s", usbid_list[i].name);
+				}
+			}
+		}
+
+		break;
+	default:
+		return (1);
+	}
+	return (0);
+}
+
+/* Axe this function in favor of a function that loads all attached devices,
+ * then subscribes to the hotplug callback */
+static void*
+novacom_usb_findandattach_thread(void *arg)
+{
+	int rc;
+	libusb_hotplug_callback_handle hdl;
+
+	// hot plug will handle this... novacom_register_attached_devices();
+
+	rc = libusb_hotplug_register_callback(ctx, LIBUSB_HOTPLUG_EVENT_DEVICE_LEFT | LIBUSB_HOTPLUG_EVENT_DEVICE_ARRIVED,
+		LIBUSB_HOTPLUG_ENUMERATE, LIBUSB_HOTPLUG_MATCH_ANY, LIBUSB_HOTPLUG_MATCH_ANY, LIBUSB_HOTPLUG_MATCH_ANY,
+		&novacom_usb_hotplug_callback, NULL, &hdl);
+
+	if(rc)
+		novacom_shutdown = 1;
+
+	while(!novacom_shutdown){
+		sleep(1);
+		(void) usbrecords_update(1);
+	}
+
+	libusb_hotplug_deregister_callback(ctx, hdl);
 	usbrecords_update(TRANSPORT_RECOVERY_TIMEOUT);
-	libusb_exit(ctx);
 	return (NULL);
 }
 
